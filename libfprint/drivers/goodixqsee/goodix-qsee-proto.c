@@ -26,6 +26,15 @@ put32 (uint8_t *p, uint32_t value)
   memcpy (p, &value, sizeof (value));
 }
 
+uint32_t
+goodix_qsee_parse_response_status (const uint8_t response[GOODIX_QSEE_RESPONSE_SIZE])
+{
+  if (get32 (response + 4))
+    return GOODIX_QSEE_TA_DEAD;
+
+  return get32 (response);
+}
+
 size_t
 goodix_qsee_parse_enumerate (const uint8_t payload[GOODIX_QSEE_ENUMERATE_SIZE],
                        struct goodix_qsee_finger out[GOODIX_QSEE_ENUMERATE_MAX],

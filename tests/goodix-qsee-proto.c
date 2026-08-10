@@ -12,10 +12,16 @@ main (void)
 {
   uint8_t enumerate[GOODIX_QSEE_ENUMERATE_SIZE] = {0};
   uint8_t irq[GOODIX_QSEE_IRQ_SIZE] = {0};
+  uint8_t response[GOODIX_QSEE_RESPONSE_SIZE] = {0};
   uint8_t enroll[180], hat[GOODIX_QSEE_HAT_SIZE] = {0};
   struct goodix_qsee_finger fingers[GOODIX_QSEE_ENUMERATE_MAX];
   struct goodix_qsee_irq_result result;
   bool mismatch;
+
+  put32 (response, GOODIX_QSEE_TOO_FAST);
+  assert (goodix_qsee_parse_response_status (response) == GOODIX_QSEE_TOO_FAST);
+  put32 (response + 4, 1);
+  assert (goodix_qsee_parse_response_status (response) == GOODIX_QSEE_TA_DEAD);
 
   put32 (enumerate + 100, 2);
   put32 (enumerate + 104, 3); put32 (enumerate + 144, 0x1234);

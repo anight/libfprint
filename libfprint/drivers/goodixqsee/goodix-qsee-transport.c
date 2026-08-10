@@ -182,7 +182,8 @@ goodix_qsee_qsee_invoke (struct goodix_qsee_qsee *qsee, uint32_t command,
   if (ioctl (qsee->fd, TEE_IOC_INVOKE, &data) || request.arg.ret)
     { if (!errno) errno = EIO; goto out; }
   memcpy (payload, body.data, payload_size);
-  if (status) memcpy (status, (uint8_t *) message.data + 128, 4);
+  if (status)
+    *status = goodix_qsee_parse_response_status ((uint8_t *) message.data + 128);
   rc = 0;
 out:
   saved = errno;

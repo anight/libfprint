@@ -11,6 +11,7 @@
 #define GOODIX_QSEE_ENUMERATE_MAX 10u
 #define GOODIX_QSEE_IRQ_SIZE 327624u
 #define GOODIX_QSEE_HAT_SIZE 69u
+#define GOODIX_QSEE_RESPONSE_SIZE 8u
 
 enum goodix_qsee_status {
   GOODIX_QSEE_SUCCESS = 0,
@@ -22,6 +23,7 @@ enum goodix_qsee_status {
   GOODIX_QSEE_IMAGER_DIRTY_1058 = 1058,
   GOODIX_QSEE_ACQUIRED_PARTIAL_1060 = 1060,
   GOODIX_QSEE_FINGER_NOT_EXIST = 1047,
+  GOODIX_QSEE_TA_DEAD = 1049,
   GOODIX_QSEE_UNTRUSTED_ENROLL = 1057,
   GOODIX_QSEE_MATCH_FAIL_AND_RETRY = 1064,
   GOODIX_QSEE_TOO_FAST = 1094,
@@ -29,6 +31,8 @@ enum goodix_qsee_status {
   GOODIX_QSEE_IMAGER_DIRTY_1104 = 1104,
   GOODIX_QSEE_TOO_SLOW = 1117,
 };
+
+uint32_t goodix_qsee_parse_response_status (const uint8_t response[GOODIX_QSEE_RESPONSE_SIZE]);
 
 struct goodix_qsee_finger {
   uint32_t group_id;
