@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "goodix-qsee-transport.h"
+#include "goodix-qsee-proto.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -93,8 +94,18 @@ goodix_qsee_qsee_open (struct goodix_qsee_qsee *qsee, const char *ta_name)
   request.params[0].c = name.id;
   data.buf_ptr = (uintptr_t) &request;
   data.buf_len = sizeof (request);
-  if (ioctl (qsee->fd, TEE_IOC_OPEN_SESSION, &data) || request.arg.ret)
-    { if (!errno) errno = EIO; goto fail; }
+  if (ioctl (qsee->fd, TEE_IOC_OPEN_SESSION, &data))
+    {
+      fprintf (stderr, "goodixqsee: TEE OPEN_SESSION ioctl failed: errno=%d\n", errno);
+      goto fail;
+    }
+  if (request.arg.ret)
+    {
+      fprintf (stderr, "goodixqsee: TEE OPEN_SESSION returned ret=0x%x origin=%u\n",
+               request.arg.ret, request.arg.ret_origin);
+      errno = EIO;
+      goto fail;
+    }
   qsee->session = request.arg.session;
   shm_release (&name);
   return 0;
@@ -148,6 +159,69 @@ build_header (struct goodix_qsee_qsee *qsee, uint8_t *header, uint32_t command,
   value = (uint32_t) payload_size; memcpy (header + 36, &value, 4);
 }
 
+/* Lenovo fingerpr uses two inline memrefs, not the gfenu patch-address ABI. */
+static int
+invoke_fingerpr (struct goodix_qsee_qsee *qsee, uint32_t command,
+                 void *payload, size_t payload_size, uint32_t *status)
+{
+  struct {
+    struct tee_ioctl_invoke_arg arg;
+    struct tee_ioctl_param params[2];
+  } request = {0};
+  struct tee_ioctl_buf_data data;
+  struct qsee_shm message = {0}, response = {0};
+  struct timespec now;
+  struct tm local;
+  uint64_t milliseconds = 0;
+  uint32_t value, log_size;
+  int saved, rc = -1;
+  const size_t request_size = 0x4b047, response_size = 0x4b040;
+
+  if (payload_size > request_size - 31 || payload_size > response_size - 12)
+    { errno = EINVAL; return -1; }
+  if (shm_alloc (qsee->fd, request_size, &message) ||
+      shm_alloc (qsee->fd, response_size, &response))
+    goto out;
+  uint8_t *input = message.data, *output = response.data;
+  memcpy (input, "android", 7);
+  value = ++qsee->token; memcpy (input + 7, &value, 4);
+  value = 1; memcpy (input + 11, &value, 4);
+  if (!clock_gettime (CLOCK_REALTIME, &now) &&
+      localtime_r (&now.tv_sec, &local))
+    milliseconds = ((uint64_t) local.tm_hour * 3600 +
+                    (uint64_t) local.tm_min * 60 + local.tm_sec) * 1000 +
+                   now.tv_nsec / 1000000;
+  memcpy (input + 15, &milliseconds, 8);
+  memcpy (input + 23, &command, 4);
+  value = (uint32_t) payload_size; memcpy (input + 27, &value, 4);
+  memcpy (input + 31, payload, payload_size);
+
+  request.arg.session = qsee->session;
+  request.arg.num_params = 2;
+  request.params[0].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT;
+  request.params[0].b = request_size;
+  request.params[0].c = message.id;
+  request.params[1].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT;
+  request.params[1].b = response_size;
+  request.params[1].c = response.id;
+  data.buf_ptr = (uintptr_t) &request;
+  data.buf_len = sizeof (request);
+  if (ioctl (qsee->fd, TEE_IOC_INVOKE, &data) || request.arg.ret)
+    { if (!errno) errno = EIO; goto out; }
+  memcpy (&log_size, output + 8, 4);
+  if (log_size > response_size - 12 - payload_size)
+    { errno = EPROTO; goto out; }
+  if (status) memcpy (status, output, 4);
+  memcpy (payload, output + 12, payload_size);
+  rc = 0;
+out:
+  saved = errno;
+  shm_release (&response);
+  shm_release (&message);
+  errno = saved;
+  return rc;
+}
+
 int
 goodix_qsee_qsee_invoke (struct goodix_qsee_qsee *qsee, uint32_t command,
                    void *payload, size_t payload_size, uint32_t *status)
@@ -162,6 +236,8 @@ goodix_qsee_qsee_invoke (struct goodix_qsee_qsee *qsee, uint32_t command,
 
   if (!qsee || qsee->fd < 0 || !payload || !payload_size || payload_size > UINT32_MAX)
     { errno = EINVAL; return -1; }
+  if (qsee->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+    return invoke_fingerpr (qsee, command, payload, payload_size, status);
   if (shm_alloc (qsee->fd, 4096, &message) ||
       shm_alloc (qsee->fd, payload_size, &body))
     goto out;

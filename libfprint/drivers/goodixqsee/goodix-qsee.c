@@ -29,6 +29,8 @@
 #define IRQ_FRAME_DONE (1u << 10)
 #define IRQ_MAX_DRAIN 12
 #define ENROLL_STAGES_PROFILE_V1 25
+#define ENROLL_STAGES_FINGERPR 8
+#define FINGERPR_OTP_PATH "/var/lib/flex5g-fp-linux/gf_otp_info"
 
 enum worker_operation { WORK_OPEN, WORK_CLOSE, WORK_LIST, WORK_DELETE,
                         WORK_ENROLL, WORK_IDENTIFY, WORK_CLEAR };
@@ -49,6 +51,7 @@ struct interactive_result {
   guint32 group_id;
   guint32 finger_id;
   guint32 status;
+  gboolean adopted_existing;
 };
 
 struct progress_event {
@@ -64,6 +67,9 @@ static const FpIdEntry id_table[] = {
   { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_MISC,
     .misc_name = "goodix_fp", .misc_compatible = "goodix,gf3626",
     .driver_data = GOODIX_QSEE_PROFILE_V1 },
+  { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_MISC,
+    .misc_name = "goodix_fp", .misc_compatible = "goodix,gxfp55a4",
+    .driver_data = GOODIX_QSEE_PROFILE_FINGERPR },
   { .udev_types = 0 }
 };
 
@@ -115,6 +121,9 @@ read_ta_name (FpDevice *device, GError **error)
   g_autofree gchar *platform = NULL;
   gchar *contents = NULL;
 
+  if (fpi_device_get_driver_data (device) == GOODIX_QSEE_PROFILE_FINGERPR)
+    return g_strdup ("fingerpr");
+
   if (!sysfs)
     { g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
                            "misc device has no sysfs path"); return NULL; }
@@ -143,6 +152,38 @@ bring_up (FpiDeviceGoodixQsee *self, GError **error)
   g_autofree guint8 *payload = g_malloc0 (5500);
   guint i;
 
+  if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+    {
+      g_autofree gchar *otp = NULL;
+      gsize otp_size = 0;
+      guint32 length = 32;
+      static const struct { guint32 command; gsize size; } fingerpr_sequence[] = {
+        { 1097, 120 }, { CMD_DETECT_SENSOR, 380 },
+        { CMD_INIT, 204 }, { CMD_INIT_FINISHED, 168 },
+      };
+      if (!g_file_get_contents (FINGERPR_OTP_PATH, &otp, &otp_size, error))
+        return FALSE;
+      if (otp_size != 33)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                               "GF3268 OTP backup must be 33 bytes");
+          return FALSE;
+        }
+      for (i = 0; i < G_N_ELEMENTS (fingerpr_sequence); i++)
+        {
+          memset (payload, 0, fingerpr_sequence[i].size);
+          if (fingerpr_sequence[i].command == CMD_INIT)
+            {
+              memcpy (payload + 132, otp, 32);
+              memcpy (payload + 196, &length, 4);
+            }
+          if (!invoke_success (self, fingerpr_sequence[i].command, payload,
+                               fingerpr_sequence[i].size, error))
+            return FALSE;
+        }
+      return TRUE;
+    }
+
   for (i = 0; i < G_N_ELEMENTS (sequence); i++)
     {
       memset (payload, 0, sequence[i].size);
@@ -156,6 +197,14 @@ bring_up (FpiDeviceGoodixQsee *self, GError **error)
 static gboolean
 set_group (FpiDeviceGoodixQsee *self, guint32 group, GError **error)
 {
+  if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+    {
+      guint8 payload[440] = {0};
+      memcpy (payload + 96, &group, 4);
+      g_strlcpy ((gchar *) payload + 184, "flex5g-linux", sizeof (payload) - 184);
+      return invoke_success (self, CMD_SET_ACTIVE_GROUP, payload,
+                             sizeof (payload), error);
+    }
   guint8 payload[104] = {0};
   memcpy (payload + 100, &group, sizeof (group));
   return invoke_success (self, CMD_SET_ACTIVE_GROUP, payload, sizeof (payload), error);
@@ -221,7 +270,9 @@ cancel_armed (FpiDeviceGoodixQsee *self)
 {
   guint8 payload[104] = {0};
   guint32 ignored;
-  goodix_qsee_qsee_invoke (&self->qsee, CMD_CANCEL, payload, sizeof (payload), &ignored);
+  goodix_qsee_qsee_invoke (&self->qsee, CMD_CANCEL, payload,
+                          self->profile == GOODIX_QSEE_PROFILE_FINGERPR ? 100 :
+                          sizeof (payload), &ignored);
 }
 
 static gboolean
@@ -237,10 +288,248 @@ finish_authentication (FpiDeviceGoodixQsee *self, const guint8 *context,
   return invoke_success (self, CMD_AUTHENTICATE_FINISH, payload, sizeof (payload), error);
 }
 
+static gboolean
+fingerpr_next_slot (FpiDeviceGoodixQsee *self, guint32 *slot, GError **error)
+{
+  g_autofree guint8 *body = g_malloc0 (44500);
+  gboolean used[10] = {0};
+  guint32 count;
+
+  if (!invoke_success (self, CMD_ENUMERATE, body, 44500, error))
+    return FALSE;
+  memcpy (&count, body + 4296, 4);
+  if (count > 10)
+    { g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                           "fingerpr returned too many templates"); return FALSE; }
+  for (guint32 i = 0; i < count; i++)
+    {
+      guint32 id;
+      memcpy (&id, body + 24500 + i * 400, 4);
+      if (id >= 245 && id <= 254) used[id - 245] = TRUE;
+    }
+  for (guint32 i = 0; i < 10; i++)
+    if (!used[i]) { *slot = 245 + i; return TRUE; }
+  g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NO_SPACE,
+                       "all ten fingerpr template slots are occupied");
+  return FALSE;
+}
+
+static gboolean
+fingerpr_slot_exists (FpiDeviceGoodixQsee *self, guint32 slot, GError **error)
+{
+  g_autofree guint8 *body = g_malloc0 (44500);
+  guint32 count;
+
+  if (!invoke_success (self, CMD_ENUMERATE, body, 44500, error))
+    return FALSE;
+  memcpy (&count, body + 4296, 4);
+  if (count > GOODIX_QSEE_ENUMERATE_MAX)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                           "fingerpr returned too many templates");
+      return FALSE;
+    }
+  for (guint32 i = 0; i < count; i++)
+    {
+      guint32 found;
+      memcpy (&found, body + 24500 + i * 400, 4);
+      if (found == slot)
+        return TRUE;
+    }
+  g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+               "fingerpr template %u is not present", slot);
+  return FALSE;
+}
+
+static gboolean
+fingerpr_commit_save (FpiDeviceGoodixQsee *self, guint32 slot,
+                      GError **error)
+{
+  static const guint8 sid[16] = {1, 2, 0, 0, 0, 0, 0, 22,
+                                 1, 0, 0, 0, 0xe8, 3, 0, 0};
+  guint8 commit[276] = {0}, save[192] = {0};
+  guint32 length = sizeof (sid), group;
+
+  memcpy (commit + 104, sid, sizeof (sid));
+  memcpy (commit + 184, &length, 4);
+  memcpy (commit + 188, &slot, 4);
+  if (!invoke_success (self, 1094, commit, sizeof (commit), error))
+    return FALSE;
+  memcpy (&group, commit + 100, 4);
+  memcpy (save + 96, &length, 4);
+  memcpy (save + 100, sid, sizeof (sid));
+  memcpy (save + 180, &group, 4);
+  memcpy (save + 184, &slot, 4);
+  return invoke_success (self, CMD_SAVE, save, sizeof (save), error);
+}
+
+static gboolean
+fingerpr_remove (FpiDeviceGoodixQsee *self, guint32 finger,
+                 GError **error)
+{
+  static const guint8 sid[16] = {1, 2, 0, 0, 0, 0, 0, 22,
+                                 1, 0, 0, 0, 0xe8, 3, 0, 0};
+  guint8 body[996] = {0};
+  guint32 length = sizeof (sid);
+  memcpy (body + 100, sid, sizeof (sid));
+  memcpy (body + 180, &length, 4);
+  memcpy (body + 188, &finger, 4);
+  return invoke_success (self, CMD_REMOVE, body, sizeof (body), error);
+}
+
+static struct interactive_result *
+capture_fingerpr (FpiDeviceGoodixQsee *self, gboolean enrolling,
+                  GCancellable *cancellable, GError **error)
+{
+  const gsize irq_size = 0x451f8;
+  g_autofree guint8 *irq = g_malloc0 (irq_size);
+  struct interactive_result *result = NULL;
+  gint64 deadline = g_get_monotonic_time () +
+                    (enrolling ? 120 : 30) * G_TIME_SPAN_SECOND;
+  guint32 slot = 0;
+  gboolean armed = FALSE;
+  const gchar *adopt_setting = g_getenv ("FLEX5G_FP_ADOPT_EXISTING");
+  gboolean adopting = enrolling && adopt_setting != NULL;
+
+  if (!set_group (self, GOODIX_QSEE_GROUP_DEFAULT, error)) return NULL;
+  if (adopting)
+    {
+      if (g_strcmp0 (adopt_setting, "245") != 0)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                               "only explicit adoption of template 245 is supported");
+          return NULL;
+        }
+      slot = 245;
+      if (!fingerpr_slot_exists (self, slot, error)) return NULL;
+    }
+  else if (enrolling)
+    {
+      guint8 body[272] = {0};
+      if (!fingerpr_next_slot (self, &slot, error) ||
+          !invoke_success (self, CMD_ENROLL, body, sizeof (body), error))
+        return NULL;
+    }
+  if (!enrolling || adopting)
+    {
+      guint8 body[200] = {0};
+      guint32 any_finger = UINT32_MAX;
+      memcpy (body + 192, &any_finger, 4);
+      if (!invoke_success (self, CMD_AUTHENTICATE, body,
+                           sizeof (body), error)) return NULL;
+    }
+  armed = TRUE;
+  if (goodix_qsee_sensor_enable_irq (&self->sensor))
+    { g_propagate_error (error, io_error ("enabling Goodix IRQ")); goto out; }
+  while (g_get_monotonic_time () < deadline)
+    {
+      int wait;
+      if (g_cancellable_is_cancelled (cancellable))
+        { g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                               "Operation cancelled"); goto out; }
+      wait = goodix_qsee_sensor_wait_irq (&self->sensor, 250);
+      if (wait < 0)
+        { g_propagate_error (error, io_error ("waiting for Goodix IRQ")); goto out; }
+      if (!wait) continue;
+      memset (irq, 0, irq_size);
+      memcpy (irq + 0x44fb8, &(guint32){2}, 4);
+      memcpy (irq + 0x44fe8, &(guint32){512}, 4);
+      memcpy (irq + 0x451f0, &(guint32){1}, 4);
+      for (guint pass = 0; pass < 8; pass++)
+        {
+          guint32 status, mask, operation, step, group, finger;
+          if (!invoke (self, 1016, irq, irq_size, &status, error)) goto out;
+          memcpy (&mask, irq + 96, 4);
+          memcpy (&operation, irq + 100, 4);
+          memcpy (&step, irq + 0x451f0, 4);
+          memcpy (&group, irq + 0x44f28, 4);
+          memcpy (&finger, irq + 0x44f2c, 4);
+          fp_dbg ("fingerpr IRQ mask=0x%08x op=%u status=%u group=%u finger=%u step=%u",
+                  mask, operation, status, group, finger, step);
+          if (mask & IRQ_FINGER_DOWN)
+            queue_progress (self, FP_FINGER_STATUS_PRESENT, -1, NULL);
+          if (mask & IRQ_FINGER_UP)
+            queue_progress (self, FP_FINGER_STATUS_NONE, -1, NULL);
+          if (enrolling && !status && (mask & IRQ_IMAGE) &&
+              operation == 0 && step == 7)
+            {
+              guint8 sample[200] = {0};
+              guint32 sample_status, duplicate;
+              guint16 remaining;
+              if (!invoke (self, 1093, sample, sizeof (sample),
+                           &sample_status, error)) goto out;
+              memcpy (&remaining, sample + 192, 2);
+              memcpy (&duplicate, sample + 196, 4);
+              if (sample_status || duplicate)
+                {
+                  queue_progress (self, FP_FINGER_STATUS_PRESENT, -1,
+                                  retry_for_status (sample_status ? sample_status :
+                                                    GOODIX_QSEE_DUPLICATE_FINGER));
+                  break;
+                }
+              queue_progress (self, FP_FINGER_STATUS_PRESENT,
+                              CLAMP (8 - (gint) remaining, 0, 8), NULL);
+              if (!remaining)
+                {
+                  if (!fingerpr_commit_save (self, slot, error)) goto out;
+                  result = g_new0 (struct interactive_result, 1);
+                  result->group_id = 0;
+                  result->finger_id = slot;
+                  goto out;
+                }
+              break;
+            }
+          if ((!enrolling || adopting) && (mask & IRQ_IMAGE) &&
+              operation == 1 && step == 7)
+            {
+              if (adopting)
+                {
+                  if (status || group != GOODIX_QSEE_GROUP_DEFAULT ||
+                      finger != slot)
+                    {
+                      queue_progress (self, FP_FINGER_STATUS_PRESENT, -1,
+                                      fpi_device_retry_new_msg (
+                                        FP_DEVICE_RETRY_GENERAL,
+                                        "Touched finger does not match the existing Linux template"));
+                      break;
+                    }
+                  result = g_new0 (struct interactive_result, 1);
+                  result->group_id = group;
+                  result->finger_id = finger;
+                  result->adopted_existing = TRUE;
+                  goto out;
+                }
+              result = g_new0 (struct interactive_result, 1);
+              result->group_id = group;
+              result->finger_id = finger;
+              result->status = status ? status :
+                               finger ? 0 : GOODIX_QSEE_MATCH_FAIL_AND_RETRY;
+              goto out;
+            }
+          if (status) break;
+          if (step == 3 || step == 4 || step == 5) continue;
+          if ((mask & IRQ_FINGER_DOWN) && step == 7 &&
+              (operation == 0 || operation == 1 || operation == 2 ||
+               operation == 4 || operation == 28 || operation == 32 ||
+               operation == 33 || operation == 34))
+            { memcpy (irq + 0x451f0, &(guint32){2}, 4); continue; }
+          break;
+        }
+    }
+  g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                       "Fingerprint operation timed out");
+out:
+  if (armed) cancel_armed (self);
+  queue_progress (self, FP_FINGER_STATUS_NONE, -1, NULL);
+  return result;
+}
+
 static struct interactive_result *
 capture_operation (FpiDeviceGoodixQsee *self, gboolean enrolling,
                    GCancellable *cancellable, GError **error)
 {
+  if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+    return capture_fingerpr (self, enrolling, cancellable, error);
   g_autofree guint8 *irq = g_malloc0 (GOODIX_QSEE_IRQ_SIZE);
   struct interactive_result *result = NULL;
   gint64 deadline = g_get_monotonic_time () + (enrolling ? 120 : 30) * G_TIME_SPAN_SECOND;
@@ -360,6 +649,7 @@ worker_thread (GTask *task, gpointer object, gpointer task_data,
         { error = io_error ("opening Goodix sensor"); break; }
       if (goodix_qsee_qsee_open (&self->qsee, self->ta_name))
         { error = io_error ("opening Goodix TA"); break; }
+      self->qsee.profile = self->profile;
       if (!bring_up (self, &error)) break;
       g_task_return_boolean (task, TRUE);
       return;
@@ -370,19 +660,42 @@ worker_thread (GTask *task, gpointer object, gpointer task_data,
       return;
     case WORK_LIST:
       {
-        g_autofree guint8 *payload = g_malloc0 (GOODIX_QSEE_ENUMERATE_SIZE);
+        gsize size = self->profile == GOODIX_QSEE_PROFILE_FINGERPR ?
+                     44500 : GOODIX_QSEE_ENUMERATE_SIZE;
+        g_autofree guint8 *payload = g_malloc0 (size);
         struct list_result *result = g_new0 (struct list_result, 1);
         if (!set_group (self, work->group_id, &error) ||
-            !invoke_success (self, CMD_ENUMERATE, payload,
-                             GOODIX_QSEE_ENUMERATE_SIZE, &error))
+            !invoke_success (self, CMD_ENUMERATE, payload, size, &error))
           { g_free (result); break; }
-        result->count = goodix_qsee_parse_enumerate (payload, result->fingers,
-                                                     &result->count_mismatch);
+        if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+          {
+            guint32 count;
+            memcpy (&count, payload + 4296, 4);
+            result->count_mismatch = count > GOODIX_QSEE_ENUMERATE_MAX;
+            result->count = MIN (count, GOODIX_QSEE_ENUMERATE_MAX);
+            for (size_t i = 0; i < result->count; i++)
+              {
+                result->fingers[i].group_id = work->group_id;
+                memcpy (&result->fingers[i].finger_id,
+                        payload + 24500 + i * 400, 4);
+              }
+          }
+        else
+          result->count = goodix_qsee_parse_enumerate (payload, result->fingers,
+                                                       &result->count_mismatch);
         g_task_return_pointer (task, result, g_free);
         return;
       }
     case WORK_DELETE:
       {
+        if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+          {
+            if (!set_group (self, work->group_id, &error) ||
+                !fingerpr_remove (self, work->finger_id, &error))
+              break;
+            g_task_return_boolean (task, TRUE);
+            return;
+          }
         guint8 payload[112];
         goodix_qsee_build_finger_command (payload, sizeof (payload),
                                           work->group_id, work->finger_id);
@@ -402,6 +715,30 @@ worker_thread (GTask *task, gpointer object, gpointer task_data,
       }
     case WORK_CLEAR:
       {
+        if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+          {
+            g_autofree guint8 *body = g_malloc0 (44500);
+            guint32 count;
+            if (!set_group (self, GOODIX_QSEE_GROUP_DEFAULT, &error) ||
+                !invoke_success (self, CMD_ENUMERATE, body, 44500, &error))
+              break;
+            memcpy (&count, body + 4296, 4);
+            if (count > 10)
+              { g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                     "fingerpr returned too many templates"); break; }
+            for (guint32 i = 0; i < count; i++)
+              {
+                guint32 finger;
+                memcpy (&finger, body + 24500 + i * 400, 4);
+                if (g_cancellable_is_cancelled (cancellable))
+                  { g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                         "Clear storage cancelled"); break; }
+                if (!fingerpr_remove (self, finger, &error)) break;
+              }
+            if (error) break;
+            g_task_return_boolean (task, TRUE);
+            return;
+          }
         guint8 enumerate[GOODIX_QSEE_ENUMERATE_SIZE] = {0};
         struct goodix_qsee_finger fingers[GOODIX_QSEE_ENUMERATE_MAX];
         size_t count, i;
@@ -503,6 +840,9 @@ enroll_done (GObject *object, GAsyncResult *async_result, gpointer unused)
   GVariant *data;
   (void) unused;
   if (!result) { fpi_device_enroll_complete (FP_DEVICE (self), NULL, g_steal_pointer (&error)); return; }
+  if (result->adopted_existing)
+    fpi_device_enroll_progress (FP_DEVICE (self), ENROLL_STAGES_FINGERPR,
+                                NULL, NULL);
   fpi_device_get_enroll_data (FP_DEVICE (self), &print);
   data = g_variant_new ("(uuu)", self->profile, result->group_id, result->finger_id);
   fpi_print_set_type (print, FPI_PRINT_RAW);
@@ -581,6 +921,8 @@ goodix_probe (FpDevice *device)
   g_autofree gchar *device_id = NULL;
 
   self->profile = fpi_device_get_driver_data (device);
+  if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
+    fpi_device_set_nr_enroll_stages (device, ENROLL_STAGES_FINGERPR);
   self->ta_name = read_ta_name (device, &error);
   if (self->ta_name)
     device_id = g_strdup_printf ("profile-%u:%s", self->profile, self->ta_name);

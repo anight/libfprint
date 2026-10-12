@@ -8,6 +8,7 @@ struct goodix_qsee_qsee {
   int fd;
   uint32_t session;
   uint32_t token;
+  uint32_t profile;
 };
 
 int goodix_qsee_qsee_open (struct goodix_qsee_qsee *qsee, const char *ta_name);
