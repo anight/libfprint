@@ -293,6 +293,10 @@ finish_authentication (FpiDeviceGoodixQsee *self, const guint8 *context,
  * already gone. */
 #define GF_ERROR_OPEN_SECURE_OBJECT_FAILED 1033u
 
+/* Images of one verification that may fail to match before it is reported
+ * as a non-match. */
+#define FINGERPR_MATCH_IMAGES 5u
+
 /* Enumerate the fingerpr templates into body (44500 bytes). A store without
  * any template is an empty list, not an error; otherwise the first finger
  * could never be enrolled. */
@@ -426,6 +430,7 @@ capture_fingerpr (FpiDeviceGoodixQsee *self, gboolean enrolling,
   gint64 deadline = g_get_monotonic_time () +
                     (enrolling ? 120 : 30) * G_TIME_SPAN_SECOND;
   guint32 slot = 0;
+  guint misses = 0;
   gboolean armed = FALSE;
   const gchar *adopt_setting = g_getenv ("FLEX5G_FP_ADOPT_EXISTING");
   gboolean adopting = enrolling && adopt_setting != NULL;
@@ -538,11 +543,24 @@ capture_fingerpr (FpiDeviceGoodixQsee *self, gboolean enrolling,
                   result->adopted_existing = TRUE;
                   goto out;
                 }
+              if (!status && !finger)
+                status = GOODIX_QSEE_MATCH_FAIL_AND_RETRY;
+              /* "Match fail and retry": the session stays armed and the
+               * next image is matched again, as in the adoption path above.
+               * One image that does not match is common (a finger still
+               * landing, a partial touch), so only several in a row are a
+               * non-match. */
+              if (status == GOODIX_QSEE_MATCH_FAIL_AND_RETRY &&
+                  ++misses < FINGERPR_MATCH_IMAGES)
+                {
+                  fp_dbg ("fingerpr image %u of %u did not match, waiting for the next",
+                          misses, FINGERPR_MATCH_IMAGES);
+                  break;
+                }
               result = g_new0 (struct interactive_result, 1);
               result->group_id = group;
               result->finger_id = finger;
-              result->status = status ? status :
-                               finger ? 0 : GOODIX_QSEE_MATCH_FAIL_AND_RETRY;
+              result->status = status;
               goto out;
             }
           if (status) break;
