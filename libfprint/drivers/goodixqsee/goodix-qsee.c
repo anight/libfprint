@@ -288,6 +288,38 @@ finish_authentication (FpiDeviceGoodixQsee *self, const guint8 *context,
   return invoke_success (self, CMD_AUTHENTICATE_FINISH, payload, sizeof (payload), error);
 }
 
+/* fingerpr answers a request about templates with this status when their
+ * secure object does not exist: nothing is enrolled yet, or the template is
+ * already gone. */
+#define GF_ERROR_OPEN_SECURE_OBJECT_FAILED 1033u
+
+/* Enumerate the fingerpr templates into body (44500 bytes). A store without
+ * any template is an empty list, not an error; otherwise the first finger
+ * could never be enrolled. */
+static gboolean
+fingerpr_enumerate (FpiDeviceGoodixQsee *self, guint8 *body, guint32 *count,
+                    GError **error)
+{
+  guint32 status;
+
+  memset (body, 0, 44500);
+  if (!invoke (self, CMD_ENUMERATE, body, 44500, &status, error))
+    return FALSE;
+  if (status == GF_ERROR_OPEN_SECURE_OBJECT_FAILED)
+    {
+      *count = 0;
+      return TRUE;
+    }
+  if (status)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Goodix command %u returned status %u", CMD_ENUMERATE, status);
+      return FALSE;
+    }
+  memcpy (count, body + 4296, 4);
+  return TRUE;
+}
+
 static gboolean
 fingerpr_next_slot (FpiDeviceGoodixQsee *self, guint32 *slot, GError **error)
 {
@@ -295,9 +327,8 @@ fingerpr_next_slot (FpiDeviceGoodixQsee *self, guint32 *slot, GError **error)
   gboolean used[10] = {0};
   guint32 count;
 
-  if (!invoke_success (self, CMD_ENUMERATE, body, 44500, error))
+  if (!fingerpr_enumerate (self, body, &count, error))
     return FALSE;
-  memcpy (&count, body + 4296, 4);
   if (count > 10)
     { g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                            "fingerpr returned too many templates"); return FALSE; }
@@ -320,9 +351,8 @@ fingerpr_slot_exists (FpiDeviceGoodixQsee *self, guint32 slot, GError **error)
   g_autofree guint8 *body = g_malloc0 (44500);
   guint32 count;
 
-  if (!invoke_success (self, CMD_ENUMERATE, body, 44500, error))
+  if (!fingerpr_enumerate (self, body, &count, error))
     return FALSE;
-  memcpy (&count, body + 4296, 4);
   if (count > GOODIX_QSEE_ENUMERATE_MAX)
     {
       g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -370,11 +400,20 @@ fingerpr_remove (FpiDeviceGoodixQsee *self, guint32 finger,
   static const guint8 sid[16] = {1, 2, 0, 0, 0, 0, 0, 22,
                                  1, 0, 0, 0, 0xe8, 3, 0, 0};
   guint8 body[996] = {0};
-  guint32 length = sizeof (sid);
+  guint32 length = sizeof (sid), status;
   memcpy (body + 100, sid, sizeof (sid));
   memcpy (body + 180, &length, 4);
   memcpy (body + 188, &finger, 4);
-  return invoke_success (self, CMD_REMOVE, body, sizeof (body), error);
+  if (!invoke (self, CMD_REMOVE, body, sizeof (body), &status, error))
+    return FALSE;
+  /* A template that is not there is removed. */
+  if (status && status != GF_ERROR_OPEN_SECURE_OBJECT_FAILED)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Goodix command %u returned status %u", CMD_REMOVE, status);
+      return FALSE;
+    }
+  return TRUE;
 }
 
 static struct interactive_result *
@@ -664,13 +703,14 @@ worker_thread (GTask *task, gpointer object, gpointer task_data,
                      44500 : GOODIX_QSEE_ENUMERATE_SIZE;
         g_autofree guint8 *payload = g_malloc0 (size);
         struct list_result *result = g_new0 (struct list_result, 1);
+        guint32 count = 0;
         if (!set_group (self, work->group_id, &error) ||
-            !invoke_success (self, CMD_ENUMERATE, payload, size, &error))
+            !(self->profile == GOODIX_QSEE_PROFILE_FINGERPR ?
+              fingerpr_enumerate (self, payload, &count, &error) :
+              invoke_success (self, CMD_ENUMERATE, payload, size, &error)))
           { g_free (result); break; }
         if (self->profile == GOODIX_QSEE_PROFILE_FINGERPR)
           {
-            guint32 count;
-            memcpy (&count, payload + 4296, 4);
             result->count_mismatch = count > GOODIX_QSEE_ENUMERATE_MAX;
             result->count = MIN (count, GOODIX_QSEE_ENUMERATE_MAX);
             for (size_t i = 0; i < result->count; i++)
@@ -720,9 +760,8 @@ worker_thread (GTask *task, gpointer object, gpointer task_data,
             g_autofree guint8 *body = g_malloc0 (44500);
             guint32 count;
             if (!set_group (self, GOODIX_QSEE_GROUP_DEFAULT, &error) ||
-                !invoke_success (self, CMD_ENUMERATE, body, 44500, &error))
+                !fingerpr_enumerate (self, body, &count, &error))
               break;
-            memcpy (&count, body + 4296, 4);
             if (count > 10)
               { g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                                      "fingerpr returned too many templates"); break; }
